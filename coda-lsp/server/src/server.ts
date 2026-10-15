@@ -11,7 +11,7 @@ connection.onInitialize((params: InitializeParams) => {
         capabilities: {
             textDocumentSync: TextDocumentSyncKind.Incremental,
             completionProvider: {triggerCharacters: [' ', '.', ':']},
-        }
+        },
     };
 });
 
