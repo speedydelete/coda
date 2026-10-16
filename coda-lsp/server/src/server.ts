@@ -15,23 +15,29 @@ connection.onInitialize((params: InitializeParams) => {
     };
 });
 
-// TO UPDATE
-const KEYWORDS = ['if', 'while', 'for', 'return', 'enum', 'union', 'struct', 'fn', 'module','include','int','int8','int16','int32','int64','uint','uint8','uint16','uint32','uint64','char','string','none','type','null','mut'];
+const KEYWORDS = [
+    'if', 'else', 'while', 'for', 'return', 'enum', 'union', 'struct', 'fn', 'module', 'include', 'mut', 'defer', 'match', 'type',
+    'int8', 'uint8', 'int16', 'uint16', 'int32', 'uint32', 'int64', 'uint64', 'float16', 'float32', 'float64',
+    'true', 'false', 'none', 'null',
+];
 
 connection.onCompletion((params) => {
-  connection.console.log('Coda LSP: onCompletion called at position ' + JSON.stringify(params.position));
-  return KEYWORDS.map((k) => ({
-    label: k,
-    kind: CompletionItemKind.Keyword
-  }));
+    connection.console.log('Coda LSP: onCompletion called at position ' + JSON.stringify(params.position));
+    return KEYWORDS.map((k) => ({
+        label: k,
+        kind: CompletionItemKind.Keyword,
+    }));
 });
 
-connection.onCompletionResolve((item) => {
-  item.detail = 'Coda keyword';
-  item.documentation = `Docs for ${item.label}`;
-  return item;
+connection.onCompletionResolve(item => {
+    item.detail = 'Coda keyword';
+    item.documentation = `Docs for ${item.label}`;
+    return item;
 });
 
-documents.onDidOpen((e) => connection.console.log('Coda LSP: document opened: ' + e.document.uri));
+documents.onDidOpen(event => {
+    connection.console.log('Coda LSP: document opened: ' + event.document.uri);
+});
+
 documents.listen(connection);
 connection.listen();
