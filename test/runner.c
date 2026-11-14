@@ -1140,6 +1140,41 @@ int main(int argc, char **argv) {
     else
         stats.failed++;
 
+    if (test_mangling())
+        stats.passed++;
+    else
+        stats.failed++;
+
+    if (test_mangling())
+        stats.passed++;
+    else
+        stats.failed++;
+
+    if (test_orion_backend())
+        stats.passed++;
+    else
+        stats.failed++;
+
+    if (test_orion_unary_not())
+        stats.passed++;
+    else
+        stats.failed++;
+
+    if (test_orion_packed_field_access())
+        stats.passed++;
+    else
+        stats.failed++;
+
+    if (test_extern_lowering())
+        stats.passed++;
+    else
+        stats.failed++;
+
+    if (test_orion_constant_unaligned_pointer())
+        stats.passed++;
+    else
+        stats.failed++;
+
     if (argc == 1) {
         test_run_path("tests", &stats);
     } else {

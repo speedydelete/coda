@@ -1,4 +1,162 @@
 #include "common.h"
+#include "../../mangle.h"
+#include "../../mangle.h"
+
+typedef struct {
+    Symbol *constraint;
+    AstName name;
+} LiftedConstraintType;
+
+static bool sema_decl_uses_name(Array generics, Array params, AstName name) {
+    for (size_t i = 0; i < generics.len; i++) {
+        AstGenericParam *param = array_at(&generics, i);
+        if (ast_name_equal(&param->name, &name))
+            return true;
+    }
+
+    for (size_t i = 0; i < params.len; i++) {
+        AstParam *param = array_at(&params, i);
+        if (ast_name_equal(&param->name, &name))
+            return true;
+    }
+
+    return false;
+}
+
+static LiftedConstraintType *sema_find_lifted_constraint_type(Array lifted, Symbol *constraint) {
+    Symbol *canonical = symbol_canonical(constraint);
+    for (size_t i = 0; i < lifted.len; i++) {
+        LiftedConstraintType *entry = array_at(&lifted, i);
+        if (symbol_canonical(entry->constraint) == canonical)
+            return entry;
+    }
+
+    return NULL;
+}
+
+static AstName sema_make_constraint_generic_name(Sema *sema, Array generics, Array params, size_t *next_name) {
+    for (;;) {
+        AstName name = {
+            .kind = AST_NAME_IDENT,
+            .ident = format(sema->arena, "_C%03zu", (*next_name)++),
+        };
+        if (!sema_decl_uses_name(generics, params, name))
+            return name;
+    }
+}
+
+static AstType *sema_lift_constraint_type(Sema *sema, Array *generics, Array params, Array *lifted, AstType *type, size_t *next_name) {
+    if (type == NULL)
+        return NULL;
+
+    switch (type->kind) {
+        case AST_TYPE_NAMED: {
+            Symbol *symbol = sema_lookup_path(sema, type->named.path);
+            if (symbol != NULL && symbol->kind == SYMBOL_CONSTRAINT && type->named.args.len == 0) {
+                LiftedConstraintType *entry = sema_find_lifted_constraint_type(*lifted, symbol);
+                if (entry == NULL) {
+                    AstName name = sema_make_constraint_generic_name(sema, *generics, params, next_name);
+                    AstGenericParam param = {
+                        .span = type->span,
+                        .name = name,
+                        .constraints = array_create(sema->arena, sizeof(AstConstraintRef)),
+                    };
+                    AstConstraintRef constraint = {
+                        .span = type->span,
+                        .kind = AST_CONSTRAINTREF_NAMED,
+                        .path = type->named.path,
+                        .args = array_create(sema->arena, sizeof(AstType *)),
+                    };
+                    array_push(&param.constraints, &constraint);
+                    array_push(generics, &param);
+
+                    LiftedConstraintType new_entry = {
+                        .constraint = symbol_canonical(symbol),
+                        .name = name,
+                    };
+                    array_push(lifted, &new_entry);
+                    entry = array_at(lifted, lifted->len - 1);
+                }
+
+                type->named.path.parts = array_create(sema->arena, sizeof(AstName));
+                array_push(&type->named.path.parts, &entry->name);
+                type->named.args = array_create(sema->arena, sizeof(AstType *));
+                return type;
+            }
+
+            if (symbol != NULL && symbol->kind == SYMBOL_TYPE && symbol->decl == NULL &&
+                symbol->type != NULL && symbol->type->kind == HIR_TYPE_ANY)
+                return type;
+
+            for (size_t i = 0; i < type->named.args.len; i++)
+                ((AstType **)type->named.args.data)[i] = sema_lift_constraint_type(sema, generics, params, lifted, ((AstType **)type->named.args.data)[i], next_name);
+            return type;
+        }
+
+        case AST_TYPE_POINTER:
+            type->pointer.pointee = sema_lift_constraint_type(sema, generics, params, lifted, type->pointer.pointee, next_name);
+            break;
+
+        case AST_TYPE_ARRAY:
+            type->array.element = sema_lift_constraint_type(sema, generics, params, lifted, type->array.element, next_name);
+            break;
+
+        case AST_TYPE_FN:
+            type->fn.ret = sema_lift_constraint_type(sema, generics, params, lifted, type->fn.ret, next_name);
+            for (size_t i = 0; i < type->fn.params.len; i++)
+                ((AstType **)type->fn.params.data)[i] = sema_lift_constraint_type(sema, generics, params, lifted, ((AstType **)type->fn.params.data)[i], next_name);
+            break;
+
+        case AST_TYPE_SUM:
+            for (size_t i = 0; i < type->sum.members.len; i++)
+                ((AstType **)type->sum.members.data)[i] = sema_lift_constraint_type(sema, generics, params, lifted, ((AstType **)type->sum.members.data)[i], next_name);
+            break;
+
+        case AST_TYPE_STRUCT:
+            type->structure.base = sema_lift_constraint_type(sema, generics, params, lifted, type->structure.base, next_name);
+            for (size_t i = 0; i < type->structure.fields.len; i++) {
+                AstField *field = array_at(&type->structure.fields, i);
+                field->type = sema_lift_constraint_type(sema, generics, params, lifted, field->type, next_name);
+            }
+            break;
+
+        case AST_TYPE_UNION:
+            for (size_t i = 0; i < type->union_.fields.len; i++) {
+                AstField *field = array_at(&type->union_.fields, i);
+                field->type = sema_lift_constraint_type(sema, generics, params, lifted, field->type, next_name);
+            }
+            break;
+
+        case AST_TYPE_ENUM:
+            type->_enum.underlying = sema_lift_constraint_type(sema, generics, params, lifted, type->_enum.underlying, next_name);
+            break;
+
+        case AST_TYPE_ERROR:
+        case AST_TYPE_SPLICE:
+        case AST_TYPE_CODE:
+            break;
+    }
+
+    return type;
+}
+
+static void sema_lift_constraint_signature_types(Sema *sema, AstFnDecl *fn) {
+    Array lifted = array_create(sema->arena, sizeof(LiftedConstraintType));
+    size_t next_name = 1;
+
+    for (size_t i = 0; i < fn->params.len; i++) {
+        AstParam *param = array_at(&fn->params, i);
+        param->type = sema_lift_constraint_type(sema, &fn->generics, fn->params, &lifted, param->type, &next_name);
+    }
+
+    fn->ret = sema_lift_constraint_type(sema, &fn->generics, fn->params, &lifted, fn->ret, &next_name);
+}
+
+static void sema_lift_constraint_type_decl(Sema *sema, AstTypeDecl *decl) {
+    Array lifted = array_create(sema->arena, sizeof(LiftedConstraintType));
+    size_t next_name = 1;
+    decl->type = sema_lift_constraint_type(sema, &decl->generics, (Array){0}, &lifted, decl->type, &next_name);
+}
 
 void sema_fn_decl(Sema *sema, AstFnDecl *ast) {
     if (ast->generics.len != 0) {
@@ -9,10 +167,18 @@ void sema_fn_decl(Sema *sema, AstFnDecl *ast) {
     if (sema_fn_has_unbound_receiver_generics(sema, ast))
         return;
 
-    Symbol *symbol = sema_lookup(sema, ast->name);
+    bool is_extern = false;
+    for (size_t i = 0; i < ast->attrs.len; i++) {
+        AstAttribute *attribute = array_at(&ast->attrs, i);
+        if (string_eq(attribute->name, STRING("extern"))) {
+            is_extern = true;
+            break;
+        }
+    }
+
+    Symbol *symbol = sema_lookup_fn_decl(sema, ast);
 
     if (symbol == NULL) {
-        //! TODO: internal compiler error
         fprintf(stderr, "Internal compiler error at %s:%u", __FILE__, __LINE__);
         return;
     }
@@ -20,7 +186,6 @@ void sema_fn_decl(Sema *sema, AstFnDecl *ast) {
     symbol->span = ast->span;
 
     if (symbol->kind != SYMBOL_FN) {
-        //! TODO: internal compiler error
         fprintf(stderr, "Internal compiler error at %s:%u", __FILE__, __LINE__);
         return;
     }
@@ -31,6 +196,8 @@ void sema_fn_decl(Sema *sema, AstFnDecl *ast) {
         *type = (HirType) {
             .kind = HIR_TYPE_FUNCTION,
             .mutable = false,
+            .size = sema->target->pointer.size,
+            .align = sema->target->pointer.align,
             .function = {
                 .ret = sema_type(sema, ast->ret),
                 .params = array_create(sema->arena, sizeof(HirType *)),
@@ -47,6 +214,16 @@ void sema_fn_decl(Sema *sema, AstFnDecl *ast) {
         symbol->type = type;
     }
 
+    if (symbol->link_name.length == 0) {
+        Array arguments = array_create(sema->arena, sizeof(HirType *));
+        symbol->link_name = coda_mangle_symbol(sema, symbol, arguments, false);
+    }
+
+    if (symbol->link_name.length == 0) {
+        Array arguments = array_create(sema->arena, sizeof(HirType *));
+        symbol->link_name = coda_mangle_symbol(sema, symbol, arguments, false);
+    }
+
     if (!sema_prepare_function_defaults(sema, symbol, true))
         return;
 
@@ -60,6 +237,7 @@ void sema_fn_decl(Sema *sema, AstFnDecl *ast) {
         .return_type = symbol->type->function.ret,
         .params = array_create(sema->arena, sizeof(HirParam)),
         .locals = array_create(sema->arena, sizeof(HirLocal)),
+        .is_extern = is_extern,
         .is_comptime = ast->comptime,
     };
 
@@ -84,8 +262,14 @@ void sema_fn_decl(Sema *sema, AstFnDecl *ast) {
     sema->current_fn = fn;
 
     //! TODO: analyse attributes properly
-    if (ast->attrs.len > 0 && string_eq(((AstAttribute *)array_at(&ast->attrs, 0))->name, STRING("export")))
-        fn->is_export = true;
+    for (size_t i = 0; i < ast->attrs.len; i++) {
+        AstAttribute attr = ((AstAttribute *)ast->attrs.data)[i];
+
+        if (string_eq(attr.name, STRING("export")))
+            fn->is_export = true;
+        else if (string_eq(attr.name, STRING("noreturn")))
+            fn->is_noreturn = true;
+    }
 
     fn->body = sema_stmt(sema, ast->body);
 
@@ -96,18 +280,22 @@ void sema_fn_decl(Sema *sema, AstFnDecl *ast) {
     }
 
     HirType *return_type = fn->return_type;
-    bool returns_none =
-        return_type != NULL &&
-        return_type->kind == HIR_TYPE_BUILTIN &&
-        return_type->builtin == BUILTIN_NONE;
+    bool returns_none = sema_type_allows_empty_return(return_type);
 
     if (!returns_none && !hir_stmt_terminates(fn->body))
         error_missing_return_value(sema->diags, return_type, ast->body->span);
 
-    if (returns_none && !hir_stmt_terminates(fn->body) && fn->body->kind == HIR_STMT_BLOCK) {
-        HirStmt *ret = arena_calloc(sema->arena, sizeof(HirStmt *));
-        ret->kind = HIR_STMT_RETURN;
-        array_push(&fn->body->block.stmts, ret);
+    if (fn->body != NULL && fn->body->kind == HIR_STMT_BLOCK && !hir_stmt_terminates(fn->body)) {
+        if (fn->is_noreturn) {
+            HirStmt *unreachable = arena_calloc(sema->arena, sizeof(*unreachable));
+            unreachable->kind = HIR_STMT_UNREACHABLE;
+            array_push(&fn->body->block.stmts, &unreachable);
+        } else if (returns_none) {
+            HirStmt *ret = arena_calloc(sema->arena, sizeof(*ret));
+            ret->kind = HIR_STMT_RETURN;
+            ret->_return.value = sema_make_empty_sum_return(sema, return_type, ast->body->span);
+            array_push(&fn->body->block.stmts, &ret);
+        }
     }
 
     sema->current_fn = previous_fn;
@@ -134,13 +322,42 @@ void sema_type_decl(Sema *sema, AstTypeDecl *ast, bool packed, bool alias) {
 
     symbol->span = ast->span;
 
+    HirType *recursive_type = NULL;
+    if (!alias && ast->type->kind == AST_TYPE_STRUCT) {
+        recursive_type = arena_calloc(sema->arena, sizeof(*recursive_type));
+        *recursive_type = (HirType){
+            .kind = HIR_TYPE_STRUCT,
+            .mutable = false,
+            .align = 1,
+            .nominal = symbol,
+            .structure.fields = array_create(sema->arena, sizeof(HirField)),
+        };
+        symbol->type = recursive_type;
+    } else if (!alias && ast->type->kind == AST_TYPE_UNION) {
+        recursive_type = arena_calloc(sema->arena, sizeof(*recursive_type));
+        *recursive_type = (HirType){
+            .kind = HIR_TYPE_UNION,
+            .mutable = false,
+            .align = 1,
+            .nominal = symbol,
+            .union_.fields = array_create(sema->arena, sizeof(HirField)),
+        };
+        symbol->type = recursive_type;
+    }
+
+    symbol->type_resolving = true;
     HirType *base = sema_type(sema, ast->type);
 
-    if (base == NULL || base->kind == HIR_TYPE_ERROR)
+    if (base == NULL || base->kind == HIR_TYPE_ERROR) {
+        symbol->type = NULL;
+        symbol->mutable_type = NULL;
+        symbol->type_resolving = false;
         return;
+    }
 
     if (alias) {
         symbol->type = base;
+        symbol->type_resolving = false;
         return;
     }
 
@@ -155,13 +372,28 @@ void sema_type_decl(Sema *sema, AstTypeDecl *ast, bool packed, bool alias) {
         base->align = 1;
     }
 
-    HirType *type = arena_calloc(sema->arena, sizeof(*type));
-    *type = *base;
-    type->mutable = false;
-    type->nominal = symbol;
-    type->base = base;
+    HirType *type;
+    if (recursive_type != NULL) {
+        type = recursive_type;
+        *type = *base;
+        type->mutable = false;
+        type->nominal = symbol;
+        type->base = base;
+    } else {
+        type = arena_calloc(sema->arena, sizeof(*type));
+        *type = *base;
+        type->mutable = false;
+        type->nominal = symbol;
+        type->base = base;
+    }
 
     symbol->type = type;
+    symbol->type_resolving = false;
+
+    if (symbol->mutable_type != NULL) {
+        *symbol->mutable_type = *type;
+        symbol->mutable_type->mutable = true;
+    }
 
     if (type->kind == HIR_TYPE_ENUM) {
         Array(HirEnumItem) inherited_items = type->_enum.items;
@@ -217,6 +449,7 @@ static bool expr_contains_call(HirExpr *expr) {
 
     switch (expr->kind) {
         case HIR_EXPR_CALL:
+        case HIR_EXPR_ANY_CALL:
             return true;
 
         case HIR_EXPR_UNARY:
@@ -258,9 +491,20 @@ bool sema_var_decl(Sema *sema, AstVarDecl *ast) {
     if (type == NULL || type->kind == HIR_TYPE_ERROR)
         return false;
 
+    bool is_extern = false;
+    if (symbol->decl != NULL) {
+        for (size_t i = 0; i < symbol->decl->attrs.len; i++) {
+            AstAttribute *attribute = array_at(&symbol->decl->attrs, i);
+            if (string_eq(attribute->name, STRING("extern"))) {
+                is_extern = true;
+                break;
+            }
+        }
+    }
+
     HirExpr *init = NULL;
 
-    if (ast->init != NULL) {
+    if (!is_extern && ast->init != NULL) {
         init = sema_expr(sema, ast->init, type);
 
         if (init == NULL || init->kind == HIR_EXPR_ERROR)
@@ -281,10 +525,21 @@ bool sema_var_decl(Sema *sema, AstVarDecl *ast) {
 
     symbol->type = type;
 
+    if (symbol->link_name.length == 0) {
+        Array arguments = array_create(sema->arena, sizeof(HirType *));
+        symbol->link_name = coda_mangle_symbol(sema, symbol, arguments, false);
+    }
+
+    if (symbol->link_name.length == 0) {
+        Array arguments = array_create(sema->arena, sizeof(HirType *));
+        symbol->link_name = coda_mangle_symbol(sema, symbol, arguments, false);
+    }
+
     HirGlobal global = {
         .symbol = symbol,
         .type = type,
         .init = init,
+        .is_extern = is_extern,
         .is_export = symbol->is_exported,
     };
 
@@ -298,10 +553,12 @@ void sema_include_decl(Sema *sema, AstIncludeDecl *ast) {}
 void sema_decl(Sema *sema, AstDecl *ast) {
     switch (ast->kind) {
         case AST_DECL_FN:
+            sema_lift_constraint_signature_types(sema, &ast->fn);
             sema_fn_decl(sema, &ast->fn);
             break;
 
         case AST_DECL_TYPE: {
+            sema_lift_constraint_type_decl(sema, &ast->type);
             bool packed = false, alias = false;
             for (size_t i = 0; i < ast->attrs.len; i++) {
                 AstAttribute *attribute = array_at(&ast->attrs, i);
@@ -406,7 +663,7 @@ void collect_decls(Sema *sema, Array(AstDecl *) decls) {
             bool is_method = d->kind == AST_DECL_FN && d->fn.receiver != NULL;
 
             if (!is_method) {
-                Symbol *s = sema_lookup(sema, sym->name);
+                Symbol *s = sema_lookup_non_method(sema, sym->name);
                 if (s != NULL) {
                     error_duplicate_symbol(sema->diags, sym->name.ident, d->span, s->span);
                     continue;

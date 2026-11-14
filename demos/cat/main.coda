@@ -1,0 +1,30 @@
+include std::io : io;
+include std::fs : fs;
+
+@extern
+fn uint64 strlen(char *s);
+
+fn string char*.to_string(char *this) {
+    return {
+        .ptr = this,
+        .len = strlen(this),
+    };
+}
+
+@export
+fn int main(mut int argc, char **argv) {
+    if (argc < 2) {
+        printn("cat: requires an argument");
+        return 1;
+    }
+
+    for (mut int i = 1; i < argc; i += 1) {
+        File f = File.open(argv[i].to_string()).expect("Failed to open file!");
+        
+        mut char[f.size()] buffer;
+        buffer.len = f.read(buffer).expect("Failed to read file!");
+        print(buffer);
+    }
+
+    return 0;
+}

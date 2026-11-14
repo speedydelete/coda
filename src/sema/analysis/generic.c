@@ -1,6 +1,38 @@
 #include <stdio.h>
 #include <assert.h>
+#include "../../mangle.h"
+#include "../../mangle.h"
 #include "common.h"
+
+static bool generic_is_untyped_numeric_expression(AstExpr *ast) {
+    if (ast == NULL)
+        return false;
+
+    switch (ast->kind) {
+        case AST_EXPR_LITERAL:
+            return ast->literal.kind == AST_LIT_INTEGER || ast->literal.kind == AST_LIT_FLOAT;
+
+        case AST_EXPR_UNARY:
+            return (ast->unary.op == AST_UNARY_POS || ast->unary.op == AST_UNARY_NEG) &&
+                   generic_is_untyped_numeric_expression(ast->unary.operand);
+
+        case AST_EXPR_BINARY:
+            switch (ast->binary.op) {
+                case AST_BINARY_ADD:
+                case AST_BINARY_SUB:
+                case AST_BINARY_MUL:
+                case AST_BINARY_DIV:
+                    return generic_is_untyped_numeric_expression(ast->binary.left) &&
+                           generic_is_untyped_numeric_expression(ast->binary.right);
+
+                default:
+                    return false;
+            }
+
+        default:
+            return false;
+    }
+}
 
 static HirExpr *generic_error_expr(Sema *sema, AstExpr *ast) {
     HirExpr *expr = arena_calloc(sema->arena, sizeof(*expr));
@@ -92,6 +124,7 @@ static bool generic_type_contains(AstFnDecl *fn, AstType *type) {
 
         case AST_TYPE_ERROR:
         case AST_TYPE_SPLICE:
+        case AST_TYPE_CODE:
             return false;
     }
 
@@ -126,7 +159,8 @@ static bool generic_infer_type(Sema *sema, AstFnDecl *fn, AstType *pattern, HirT
         DiagBuilder diagnostic = diag_begin(sema->diags, DIAG_ERROR, E_GENERIC_TYPE_MISMATCH, span, STRING("conflicting types inferred for a generic parameter"));
         diag_note(&diagnostic, STRING("make the argument types agree or supply explicit type arguments"));
         diag_finish(&diagnostic);
-        *reported_error = true;
+        if (reported_error != NULL)
+            *reported_error = true;
         return false;
     }
 
@@ -195,10 +229,41 @@ static bool generic_infer_type(Sema *sema, AstFnDecl *fn, AstType *pattern, HirT
         case AST_TYPE_NAMED:
         case AST_TYPE_ERROR:
         case AST_TYPE_SPLICE:
+        case AST_TYPE_CODE:
             return false;
     }
 
     return false;
+}
+
+bool sema_generic_method_receiver_matches(Sema *sema, AstFnDecl *fn, HirType *receiver, bool *is_generic_pattern) {
+    *is_generic_pattern = false;
+
+    if (fn == NULL || fn->receiver == NULL || fn->generics.len == 0)
+        return false;
+
+    AstType *pattern = fn->receiver;
+    while (pattern != NULL && pattern->kind == AST_TYPE_POINTER)
+        pattern = pattern->pointer.pointee;
+
+    if (!generic_type_contains(fn, pattern))
+        return false;
+
+    *is_generic_pattern = true;
+
+    if (receiver == NULL)
+        return false;
+
+    while (receiver->kind == HIR_TYPE_POINTER)
+        receiver = receiver->pointer.pointee;
+
+    Array arguments = array_create(sema->arena, sizeof(HirType *));
+    for (size_t i = 0; i < fn->generics.len; i++) {
+        HirType *type = NULL;
+        array_push(&arguments, &type);
+    }
+
+    return generic_infer_type(sema, fn, pattern, receiver, arguments, pattern->span, NULL);
 }
 
 static bool generic_arguments_equal(Array left, Array right) {
@@ -318,6 +383,10 @@ static Symbol *generic_create_instance(Sema *sema, Symbol *generic, Array receiv
         return NULL;
     }
 
+    Symbol link_symbol = *generic;
+    link_symbol.type = instance->type;
+    instance->link_name = coda_mangle_symbol(sema, &link_symbol, arguments, true);
+
     Array cached_receiver_arguments = array_create(sema->arena, sizeof(HirType *));
     for (size_t i = 0; i < receiver_arguments.len; i++) {
         HirType *type = ((HirType **)receiver_arguments.data)[i];
@@ -364,7 +433,9 @@ static HirExpr *sema_generic_call_impl(Sema *sema, AstExpr *ast, HirType *expect
 
     HirExpr **inferred_values = arena_calloc(sema->arena, sizeof(HirExpr *) * param_count);
 
-    if (ast->call.generic_args.len != 0) {
+    bool explicit_arguments = ast->call.generic_args.len != 0;
+
+    if (explicit_arguments) {
         if (ast->call.generic_args.len != template->generics.len)
             return generic_error(sema, ast, E_GENERIC_ARGUMENT_COUNT, STRING("generic argument count does not match the declaration"), STRING("provide one type argument for each generic parameter"));
 
@@ -375,7 +446,29 @@ static HirExpr *sema_generic_call_impl(Sema *sema, AstExpr *ast, HirType *expect
                 return generic_error_expr(sema, ast);
             *(HirType **)array_at(&arguments, i) = type;
         }
-    } else {
+    }
+
+    if (has_implicit_receiver && receiver != NULL && template->receiver != NULL) {
+        AstType *pattern = template->receiver;
+        while (pattern != NULL && pattern->kind == AST_TYPE_POINTER)
+            pattern = pattern->pointer.pointee;
+
+        if (generic_type_contains(template, pattern)) {
+            HirType *actual = receiver->type;
+            if (actual != NULL && actual->kind == HIR_TYPE_POINTER)
+                actual = actual->pointer.pointee;
+
+            bool reported_error = false;
+            if (!generic_infer_type(sema, template, pattern, actual, arguments, ast->span, &reported_error)) {
+                if (reported_error)
+                    return generic_error_expr(sema, ast);
+
+                return generic_error(sema, ast, E_GENERIC_TYPE_MISMATCH, STRING("receiver type does not match the generic method"), STRING("check the receiver type and generic parameter bindings"));
+            }
+        }
+    }
+
+    if (!explicit_arguments) {
         for (size_t i = 0; i < ast->call.args.len; i++) {
             AstCallArg *ast_arg = array_at(&ast->call.args, i);
             size_t parameter = arg_params[i];
@@ -383,23 +476,31 @@ static HirExpr *sema_generic_call_impl(Sema *sema, AstExpr *ast, HirType *expect
             if (!generic_type_contains(template, param->type))
                 continue;
 
-            HirExpr *value = sema_expr(sema, ast_arg->value, NULL);
+            HirType *expected = NULL;
+            size_t generic_index = generic_type_index(template, param->type);
+
+            if (generic_index != SIZE_MAX)
+                expected = ((HirType **)arguments.data)[generic_index];
+
+            HirExpr *value = sema_expr(sema, ast_arg->value, expected != NULL && generic_is_untyped_numeric_expression(ast_arg->value) ? expected : NULL);
             if (value == NULL || value->kind == HIR_EXPR_ERROR)
                 return generic_error_expr(sema, ast);
+
             inferred_values[parameter] = value;
 
             bool reported_error = false;
             if (!generic_infer_type(sema, template, param->type, value->type, arguments, ast_arg->span, &reported_error)) {
                 if (reported_error)
                     return generic_error_expr(sema, ast);
+
                 return generic_error(sema, ast, E_CANNOT_INFER_GENERIC, STRING("could not infer generic type arguments from the arguments"), STRING("supply explicit type arguments at the call site"));
             }
         }
+    }
 
-        for (size_t i = 0; i < arguments.len; i++) {
-            if (((HirType **)arguments.data)[i] == NULL)
-                return generic_error(sema, ast, E_CANNOT_INFER_GENERIC, STRING("could not infer all generic type arguments"), STRING("supply explicit type arguments at the call site"));
-        }
+    for (size_t i = 0; i < arguments.len; i++) {
+        if (((HirType **)arguments.data)[i] == NULL)
+            return generic_error(sema, ast, E_CANNOT_INFER_GENERIC, STRING("could not infer all generic type arguments"), STRING("supply explicit type arguments at the call site"));
     }
 
     if (!sema_check_symbol_generic_constraints(sema, generic, template->generics, arguments, ast->span))
@@ -431,7 +532,7 @@ static HirExpr *sema_generic_call_impl(Sema *sema, AstExpr *ast, HirType *expect
         HirType *receiver_param = ((HirType **)instance->type->function.params.data)[0];
 
         if (receiver_param->kind == HIR_TYPE_POINTER && receiver->type != NULL &&
-            type_equal(receiver->type, receiver_param->pointer.pointee) && sema_is_place(receiver)) {
+            type_equal(receiver->type, receiver_param->pointer.pointee)) {
             HirExpr *address = arena_calloc(sema->arena, sizeof(*address));
             *address = (HirExpr){
                 .span = receiver->span,

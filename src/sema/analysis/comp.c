@@ -520,6 +520,7 @@ bool comp_expr_is_evaluable(HirExpr *expr) {
 
     switch (expr->kind) {
         case HIR_EXPR_LITERAL:
+        case HIR_EXPR_CODE:
             return true;
 
         case HIR_EXPR_VALUE:
@@ -873,7 +874,43 @@ static CompExecResult exec_stmt(CompContext *context, HirStmt *stmt) {
         }
 
 case HIR_STMT_ASSIGN: {
-    HirExpr *value = comp_eval_expr(context, stmt->assign.value);
+    HirExpr *value;
+    if (stmt->assign.op == AST_BINARY_ASSIGN) {
+        value = comp_eval_expr(context, stmt->assign.value);
+    } else {
+        HirExpr *left = comp_eval_expr(context, stmt->assign.target);
+        HirExpr *right = comp_eval_expr(context, stmt->assign.value);
+        if (left == NULL || right == NULL || !comp_expr_is_evaluable(left) || !comp_expr_is_evaluable(right))
+            return (CompExecResult){.kind = COMP_EXEC_ERROR};
+
+        if (stmt->assign.operation_type != NULL) {
+            left = sema_coerce(context->sema, left, stmt->assign.operation_type);
+            right = sema_coerce(context->sema, right, stmt->assign.right_type);
+            if (left == NULL || right == NULL)
+                return (CompExecResult){.kind = COMP_EXEC_ERROR};
+
+            left = comp_eval_expr(context, left);
+            right = comp_eval_expr(context, right);
+            if (left == NULL || right == NULL)
+                return (CompExecResult){.kind = COMP_EXEC_ERROR};
+        }
+
+        HirExpr binary = {
+            .span = stmt->span,
+            .kind = HIR_EXPR_BINARY,
+            .type = stmt->assign.operation_type != NULL
+                ? stmt->assign.operation_type
+                : stmt->assign.target->type,
+            .binary = {.op = stmt->assign.op, .left = left, .right = right},
+        };
+        value = comp_eval_expr(context, &binary);
+
+        if (value != NULL && stmt->assign.operation_type != NULL) {
+            value = sema_coerce(context->sema, value, stmt->assign.target->type);
+            if (value != NULL)
+                value = comp_eval_expr(context, value);
+        }
+    }
 
     if (value == NULL || !comp_expr_is_evaluable(value))
         return (CompExecResult){.kind = COMP_EXEC_ERROR};
@@ -924,17 +961,23 @@ case HIR_STMT_ASSIGN: {
 
                 switch (result.kind) {
                     case COMP_EXEC_NORMAL:
-                        continue;
-
+                    case COMP_EXEC_CONTINUE:
+                        break;
+                    
                     case COMP_EXEC_BREAK:
                         return (CompExecResult){.kind = COMP_EXEC_NORMAL};
-
-                    case COMP_EXEC_CONTINUE:
-                        continue;
 
                     default:
                         return result;
                 }
+
+                if (stmt->_while.post != NULL) {
+                    CompExecResult post = exec_stmt(context, stmt->_while.post);
+                    if (post.kind != COMP_EXEC_NORMAL)
+                        return post;
+                }
+
+                continue;
             }
 
         case HIR_STMT_BREAK:
@@ -986,10 +1029,383 @@ static CompExecResult eval_function(CompContext *context, HirFunction *function,
     return result;
 }
 
+static HirExpr *comp_code_splice_error(CompContext *context, AstExpr *splice, String message) {
+    DiagBuilder diagnostic = diag_begin(
+        context->sema->diags, DIAG_ERROR, E_TYPE_MISMATCH, splice->span, message);
+    diag_finish(&diagnostic);
+
+    HirExpr *error = arena_calloc(context->sema->arena, sizeof(*error));
+    error->span = splice->span;
+    error->kind = HIR_EXPR_ERROR;
+    return error;
+}
+
+static HirCodeSplice *comp_find_code_splice(Array splices, AstExpr *ast) {
+    for (size_t i = 0; i < splices.len; i++) {
+        HirCodeSplice *splice = array_at(&splices, i);
+        if (splice->splice == ast)
+            return splice;
+    }
+    return NULL;
+}
+
+static HirCodeSplice *comp_find_code_name_splice(Array splices, AstName *name) {
+    for (size_t i = 0; i < splices.len; i++) {
+        HirCodeSplice *splice = array_at(&splices, i);
+        if (splice->name_splice == name)
+            return splice;
+    }
+    return NULL;
+}
+
+static AstName comp_expand_quoted_name(CompContext *context, AstName *ast, Array splices, bool *ok) {
+    if (ast == NULL || ast->kind != AST_NAME_SPLICE || !*ok)
+        return ast != NULL ? *ast : (AstName){.kind = AST_NAME_ERROR};
+
+    HirCodeSplice *splice = comp_find_code_name_splice(splices, ast);
+    if (splice == NULL) {
+        *ok = false;
+        return (AstName){.kind = AST_NAME_ERROR};
+    }
+
+    HirExpr *value = comp_eval_expr(context, splice->value);
+    HirType *type = value != NULL ? base_type(value->type) : NULL;
+    if (value == NULL || value->kind != HIR_EXPR_CODE || !value->code.is_name ||
+        type == NULL || type->kind != HIR_TYPE_CODE ||
+        type->code.category != CODE_CATEGORY_NAME ||
+        value->code.name.kind != AST_NAME_IDENT) {
+        *ok = false;
+        return (AstName){.kind = AST_NAME_ERROR};
+    }
+
+    return value->code.name;
+}
+
+static Path comp_expand_quoted_path(CompContext *context, Path path, Array splices, bool *ok) {
+    Path result = {
+        .parts = array_create(context->sema->arena, sizeof(AstName)),
+    };
+
+    for (size_t i = 0; i < path.parts.len; i++) {
+        AstName *source = array_at(&path.parts, i);
+        AstName name = comp_expand_quoted_name(context, source, splices, ok);
+        array_push(&result.parts, &name);
+    }
+
+    return result;
+}
+
+static AstExpr *comp_expand_quoted_expression(
+    CompContext *context, AstExpr *ast, Array splices, bool *ok
+) {
+    if (ast == NULL || !*ok)
+        return ast;
+
+    if (ast->kind == AST_EXPR_SPLICE) {
+        HirCodeSplice *splice = comp_find_code_splice(splices, ast);
+        if (splice == NULL) {
+            *ok = false;
+            return NULL;
+        }
+
+        HirExpr *value = comp_eval_expr(context, splice->value);
+        HirType *type = value != NULL ? base_type(value->type) : NULL;
+        if (value == NULL || value->kind != HIR_EXPR_CODE ||
+            value->code.is_name ||
+            type == NULL || type->kind != HIR_TYPE_CODE ||
+            type->code.category != CODE_CATEGORY_EXPR ||
+            value->code.expression == NULL) {
+            *ok = false;
+            return NULL;
+        }
+
+        return value->code.expression;
+    }
+
+    /* A nested quotation owns its own splice scope. */
+    if (ast->kind == AST_EXPR_QUOTE)
+        return ast;
+
+    AstExpr *copy = arena_calloc(context->sema->arena, sizeof(*copy));
+    *copy = *ast;
+
+#define EXPAND_EXPR(member) \
+    copy->member = comp_expand_quoted_expression(context, ast->member, splices, ok)
+
+    switch (ast->kind) {
+        case AST_EXPR_UNARY:
+            EXPAND_EXPR(unary.operand);
+            break;
+
+        case AST_EXPR_IDENT:
+            copy->ident = comp_expand_quoted_name(
+                context, &ast->ident, splices, ok);
+            break;
+
+        case AST_EXPR_PATH:
+            copy->path = comp_expand_quoted_path(
+                context, ast->path, splices, ok);
+            break;
+
+        case AST_EXPR_BINARY:
+            EXPAND_EXPR(binary.left);
+            EXPAND_EXPR(binary.right);
+            break;
+
+        case AST_EXPR_CALL: {
+            EXPAND_EXPR(call.callee);
+            copy->call.args = array_create(context->sema->arena, sizeof(AstCallArg));
+            for (size_t i = 0; i < ast->call.args.len; i++) {
+                AstCallArg arg = ((AstCallArg *)ast->call.args.data)[i];
+                arg.name = comp_expand_quoted_name(
+                    context, &((AstCallArg *)ast->call.args.data)[i].name, splices, ok);
+                arg.value = comp_expand_quoted_expression(context, arg.value, splices, ok);
+                array_push(&copy->call.args, &arg);
+            }
+            break;
+        }
+
+        case AST_EXPR_INFERRED_METHOD_CALL: {
+            copy->inferred_method_call.name = comp_expand_quoted_name(
+                context, &ast->inferred_method_call.name, splices, ok);
+            copy->inferred_method_call.args = array_create(context->sema->arena, sizeof(AstCallArg));
+            for (size_t i = 0; i < ast->inferred_method_call.args.len; i++) {
+                AstCallArg arg = ((AstCallArg *)ast->inferred_method_call.args.data)[i];
+                arg.name = comp_expand_quoted_name(
+                    context, &((AstCallArg *)ast->inferred_method_call.args.data)[i].name, splices, ok);
+                arg.value = comp_expand_quoted_expression(context, arg.value, splices, ok);
+                array_push(&copy->inferred_method_call.args, &arg);
+            }
+            break;
+        }
+
+        case AST_EXPR_INDEX:
+            EXPAND_EXPR(index.object);
+            EXPAND_EXPR(index.index);
+            break;
+
+        case AST_EXPR_MEMBER:
+            EXPAND_EXPR(member.object);
+            copy->member.member = comp_expand_quoted_name(
+                context, &ast->member.member, splices, ok);
+            break;
+
+        case AST_EXPR_CAST:
+            EXPAND_EXPR(cast.operand);
+            break;
+
+        case AST_EXPR_INTRINSIC: {
+            copy->intrinsic.name = comp_expand_quoted_path(
+                context, ast->intrinsic.name, splices, ok);
+            copy->intrinsic.args = array_create(context->sema->arena, sizeof(AstIntrinsicArg));
+            for (size_t i = 0; i < ast->intrinsic.args.len; i++) {
+                AstIntrinsicArg arg = ((AstIntrinsicArg *)ast->intrinsic.args.data)[i];
+                if (arg.kind == AST_INTRINSIC_ARG_EXPR)
+                    arg.expr = comp_expand_quoted_expression(context, arg.expr, splices, ok);
+                else if (arg.kind == AST_INTRINSIC_ARG_MEMBER_PATH) {
+                    arg.member_path = array_create(context->sema->arena, sizeof(AstName));
+                    for (size_t j = 0; j < ((AstIntrinsicArg *)ast->intrinsic.args.data)[i].member_path.len; j++) {
+                        AstName *source = array_at(
+                            &((AstIntrinsicArg *)ast->intrinsic.args.data)[i].member_path, j);
+                        AstName name = comp_expand_quoted_name(context, source, splices, ok);
+                        array_push(&arg.member_path, &name);
+                    }
+                }
+                array_push(&copy->intrinsic.args, &arg);
+            }
+            break;
+        }
+
+        case AST_EXPR_BUBBLE:
+            EXPAND_EXPR(bubble.operand);
+            break;
+
+        case AST_EXPR_INIT: {
+            copy->init.fields = array_create(context->sema->arena, sizeof(AstInitField));
+            for (size_t i = 0; i < ast->init.fields.len; i++) {
+                AstInitField field = ((AstInitField *)ast->init.fields.data)[i];
+                field.name = comp_expand_quoted_name(
+                    context, &((AstInitField *)ast->init.fields.data)[i].name, splices, ok);
+                field.value = comp_expand_quoted_expression(context, field.value, splices, ok);
+                array_push(&copy->init.fields, &field);
+            }
+            break;
+        }
+
+        case AST_EXPR_ERROR:
+        case AST_EXPR_LITERAL:
+        case AST_EXPR_TYPE_VALUE:
+        case AST_EXPR_LAMBDA:
+        case AST_EXPR_SPLICE:
+        case AST_EXPR_QUOTE:
+            break;
+    }
+
+#undef EXPAND_EXPR
+    return copy;
+}
+
+static AstStmt *comp_expand_quoted_statement(
+    CompContext *context, AstStmt *ast, Array splices, bool *ok
+) {
+    if (ast == NULL || !*ok)
+        return ast;
+
+    AstStmt *copy = arena_calloc(context->sema->arena, sizeof(*copy));
+    *copy = *ast;
+
+    switch (ast->kind) {
+        case AST_STMT_BLOCK:
+            copy->block.stmts = array_create(context->sema->arena, sizeof(AstStmt *));
+            for (size_t i = 0; i < ast->block.stmts.len; i++) {
+                AstStmt *child = ((AstStmt **)ast->block.stmts.data)[i];
+                AstStmt *expanded = comp_expand_quoted_statement(context, child, splices, ok);
+                array_push(&copy->block.stmts, &expanded);
+            }
+            break;
+
+        case AST_STMT_VAR: {
+            AstVarDecl *var = arena_calloc(context->sema->arena, sizeof(*var));
+            *var = *ast->var;
+            var->name = comp_expand_quoted_name(context, &ast->var->name, splices, ok);
+            var->init = comp_expand_quoted_expression(context, ast->var->init, splices, ok);
+            copy->var = var;
+            break;
+        }
+
+        case AST_STMT_EXPR:
+            copy->expr = comp_expand_quoted_expression(context, ast->expr, splices, ok);
+            break;
+
+        case AST_STMT_RETURN:
+            copy->_return.value = comp_expand_quoted_expression(
+                context, ast->_return.value, splices, ok);
+            break;
+
+        case AST_STMT_IF:
+            copy->_if.cond = comp_expand_quoted_expression(context, ast->_if.cond, splices, ok);
+            copy->_if.then = comp_expand_quoted_statement(context, ast->_if.then, splices, ok);
+            copy->_if._else = comp_expand_quoted_statement(context, ast->_if._else, splices, ok);
+            break;
+
+        case AST_STMT_FOR:
+            copy->_for.init = comp_expand_quoted_statement(context, ast->_for.init, splices, ok);
+            copy->_for.cond = comp_expand_quoted_expression(context, ast->_for.cond, splices, ok);
+            copy->_for.post = comp_expand_quoted_expression(context, ast->_for.post, splices, ok);
+            copy->_for.body = comp_expand_quoted_statement(context, ast->_for.body, splices, ok);
+            break;
+
+        case AST_STMT_WHILE:
+            copy->_while.cond = comp_expand_quoted_expression(context, ast->_while.cond, splices, ok);
+            copy->_while.body = comp_expand_quoted_statement(context, ast->_while.body, splices, ok);
+            break;
+
+        case AST_STMT_MATCH:
+            copy->match.expr = comp_expand_quoted_expression(context, ast->match.expr, splices, ok);
+            copy->match.cases = array_create(context->sema->arena, sizeof(AstMatchCase));
+            for (size_t i = 0; i < ast->match.cases.len; i++) {
+                AstMatchCase case_ = ((AstMatchCase *)ast->match.cases.data)[i];
+                case_.body = comp_expand_quoted_statement(context, case_.body, splices, ok);
+                array_push(&copy->match.cases, &case_);
+            }
+            break;
+
+        case AST_STMT_DEFER:
+            copy->defer.deferred = comp_expand_quoted_statement(
+                context, ast->defer.deferred, splices, ok);
+            break;
+
+        case AST_STMT_BREAK:
+            copy->_break.value = comp_expand_quoted_expression(
+                context, ast->_break.value, splices, ok);
+            break;
+
+        case AST_STMT_CONTINUE:
+            copy->_continue.value = comp_expand_quoted_expression(
+                context, ast->_continue.value, splices, ok);
+            break;
+
+        case AST_STMT_ERROR:
+        default:
+            break;
+    }
+
+    return copy;
+}
+
+static AstDecl *comp_expand_quoted_declaration(
+    CompContext *context, AstDecl *ast, Array splices, bool *ok
+) {
+    if (ast == NULL || ast->kind != AST_DECL_FN || !*ok) {
+        *ok = false;
+        return NULL;
+    }
+
+    AstDecl *copy = arena_calloc(context->sema->arena, sizeof(*copy));
+    *copy = *ast;
+    copy->fn.name = comp_expand_quoted_name(context, &ast->fn.name, splices, ok);
+
+    copy->fn.params = array_create(context->sema->arena, sizeof(AstParam));
+    for (size_t i = 0; i < ast->fn.params.len; i++) {
+        AstParam param = ((AstParam *)ast->fn.params.data)[i];
+        param.name = comp_expand_quoted_name(context, &param.name, splices, ok);
+        param.default_value = comp_expand_quoted_expression(
+            context, param.default_value, splices, ok);
+        array_push(&copy->fn.params, &param);
+    }
+
+    copy->fn.body = comp_expand_quoted_statement(context, ast->fn.body, splices, ok);
+    return copy;
+}
+
+static HirExpr *comp_eval_code(CompContext *context, HirExpr *expr) {
+    if (expr->code.is_name)
+        return expr;
+
+    if (expr->code.splices.len == 0)
+        return expr;
+
+    if (expr->code.is_decl) {
+        bool ok = true;
+        AstDecl *expanded = comp_expand_quoted_declaration(
+            context, expr->code.declaration, expr->code.splices, &ok);
+        if (!ok || expanded == NULL) {
+            HirCodeSplice *first = array_at(&expr->code.splices, 0);
+            return comp_code_splice_error(context, first->owner,
+                STRING("failed to expand declaration splice; expected a #code::name<ident> value"));
+        }
+
+        HirExpr *result = arena_calloc(context->sema->arena, sizeof(*result));
+        *result = *expr;
+        result->code.declaration = expanded;
+        result->code.splices = array_create(context->sema->arena, sizeof(HirCodeSplice));
+        return result;
+    }
+
+    bool ok = true;
+    AstExpr *expanded = comp_expand_quoted_expression(
+        context, expr->code.expression, expr->code.splices, &ok);
+    if (!ok || expanded == NULL) {
+        HirCodeSplice *first = array_at(&expr->code.splices, 0);
+        AstExpr *splice = first->owner;
+        return comp_code_splice_error(context, splice,
+            STRING("failed to expand code splice; expected a compatible #code value"));
+    }
+
+    HirExpr *result = arena_calloc(context->sema->arena, sizeof(*result));
+    *result = *expr;
+    result->code.expression = expanded;
+    result->code.splices = array_create(context->sema->arena, sizeof(HirCodeSplice));
+    return result;
+}
+
 HirExpr *comp_eval_expr(CompContext *context, HirExpr *expr) {
     switch (expr->kind) {
         case HIR_EXPR_LITERAL:
             return expr;
+
+        case HIR_EXPR_CODE:
+            return comp_eval_code(context, expr);
 
         case HIR_EXPR_VALUE: {
             Symbol *symbol = expr->value.symbol;

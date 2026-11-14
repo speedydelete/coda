@@ -19,8 +19,73 @@ static const char *type_kind_name(HirTypeKind kind) {
     case HIR_TYPE_STRUCT:  return "struct";
     case HIR_TYPE_UNION:   return "union";
     case HIR_TYPE_ENUM:    return "enum";
+    case HIR_TYPE_ANY:     return "any";
+    case HIR_TYPE_ANY_CONSTRAINT: return "any_constraint";
+    case HIR_TYPE_CODE:    return "code";
     }
 
+    return "?";
+}
+
+static const char *code_category_name(CodeCategory category) {
+    switch (category) {
+        case CODE_CATEGORY_EXPR: return "expr";
+        case CODE_CATEGORY_STMT: return "stmt";
+        case CODE_CATEGORY_DECL: return "decl";
+        case CODE_CATEGORY_TYPE: return "type";
+        case CODE_CATEGORY_NAME: return "name";
+    }
+    return "?";
+}
+
+static const char *code_node_name(CodeNodeKind node) {
+    switch (node) {
+        case CODE_NODE_ANY: return "";
+        case CODE_NODE_EXPR_LITERAL: return "literal";
+        case CODE_NODE_EXPR_IDENT: return "ident";
+        case CODE_NODE_EXPR_PATH: return "path";
+        case CODE_NODE_EXPR_TYPE_VALUE: return "type_value";
+        case CODE_NODE_EXPR_UNARY: return "unary";
+        case CODE_NODE_EXPR_BINARY: return "binary";
+        case CODE_NODE_EXPR_CALL: return "call";
+        case CODE_NODE_EXPR_INFERRED_METHOD_CALL: return "inferred_method_call";
+        case CODE_NODE_EXPR_INDEX: return "index";
+        case CODE_NODE_EXPR_MEMBER: return "member";
+        case CODE_NODE_EXPR_CAST: return "cast";
+        case CODE_NODE_EXPR_INTRINSIC: return "intrinsic";
+        case CODE_NODE_EXPR_BUBBLE: return "bubble";
+        case CODE_NODE_EXPR_INIT: return "init";
+        case CODE_NODE_EXPR_LAMBDA: return "lambda";
+        case CODE_NODE_EXPR_SPLICE: return "splice";
+        case CODE_NODE_STMT_VAR: return "var";
+        case CODE_NODE_STMT_EXPR: return "expr";
+        case CODE_NODE_STMT_BLOCK: return "block";
+        case CODE_NODE_STMT_RETURN: return "return";
+        case CODE_NODE_STMT_IF: return "if";
+        case CODE_NODE_STMT_FOR: return "for";
+        case CODE_NODE_STMT_WHILE: return "while";
+        case CODE_NODE_STMT_MATCH: return "match";
+        case CODE_NODE_STMT_BREAK: return "break";
+        case CODE_NODE_STMT_CONTINUE: return "continue";
+        case CODE_NODE_STMT_DEFER: return "defer";
+        case CODE_NODE_DECL_INCLUDE: return "include";
+        case CODE_NODE_DECL_TYPE: return "type";
+        case CODE_NODE_DECL_VAR: return "var";
+        case CODE_NODE_DECL_FN: return "fn";
+        case CODE_NODE_DECL_CONSTRAINT: return "constraint";
+        case CODE_NODE_TYPE_NAMED: return "named";
+        case CODE_NODE_TYPE_POINTER: return "pointer";
+        case CODE_NODE_TYPE_ARRAY: return "array";
+        case CODE_NODE_TYPE_FN: return "fn";
+        case CODE_NODE_TYPE_SUM: return "sum";
+        case CODE_NODE_TYPE_STRUCT: return "struct";
+        case CODE_NODE_TYPE_UNION: return "union";
+        case CODE_NODE_TYPE_ENUM: return "enum";
+        case CODE_NODE_TYPE_SPLICE: return "splice";
+        case CODE_NODE_NAME_IDENT: return "ident";
+        case CODE_NODE_NAME_SPLICE: return "splice";
+        case CODE_NODE_EXPR_QUOTE: return "quote";
+    }
     return "?";
 }
 
@@ -36,7 +101,11 @@ static const char *expr_kind_name(HirExprKind kind) {
     case HIR_EXPR_FIELD:     return "field";
     case HIR_EXPR_CAST:      return "cast";
     case HIR_EXPR_INIT:      return "init";
+    case HIR_EXPR_VLA_ALLOC: return "vla_alloc";
     case HIR_EXPR_LAMBDA:    return "lambda";
+    case HIR_EXPR_ANY_BOX:   return "any_box";
+    case HIR_EXPR_ANY_CALL:  return "any_call";
+    case HIR_EXPR_CODE:      return "code";
     }
 
     return "?";
@@ -187,6 +256,27 @@ static void print_type(FILE *out, const HirType *type, unsigned depth) {
         }
         break;
 
+    case HIR_TYPE_ANY:
+        break;
+
+    case HIR_TYPE_CODE:
+        indent(out, depth + 1);
+        fprintf(out, "#code::%s", code_category_name(type->code.category));
+        if (type->code.node != CODE_NODE_ANY)
+            fprintf(out, "<%s>", code_node_name(type->code.node));
+        fputc('\n', out);
+        break;
+
+    case HIR_TYPE_ANY_CONSTRAINT:
+        indent(out, depth + 1);
+        fputs("constraint ", out);
+        if (type->any_constraint.constraint != NULL && type->any_constraint.constraint->name.kind == AST_NAME_IDENT)
+            fprintf(out, "%.*s", (int)type->any_constraint.constraint->name.ident.length, type->any_constraint.constraint->name.ident.data);
+        else
+            fputs("<null>", out);
+        fputc('\n', out);
+        break;
+
     case HIR_TYPE_ERROR:
         break;
     }
@@ -257,9 +347,14 @@ static void print_expr(FILE *out, const HirExpr *expr, unsigned depth) {
 
     case HIR_EXPR_CALL:
         indent(out, depth + 1);
-        fputs("function ", out);
-        print_symbol(out, expr->call.function);
-        fputc('\n', out);
+        if (expr->call.function != NULL) {
+            fputs("function ", out);
+            print_symbol(out, expr->call.function);
+            fputc('\n', out);
+        } else {
+            fputs("callee\n", out);
+            print_expr(out, expr->call.callee, depth + 2);
+        }
 
         for (size_t i = 0; i < expr->call.args.len; i++) {
             HirExpr *arg =
@@ -305,7 +400,62 @@ static void print_expr(FILE *out, const HirExpr *expr, unsigned depth) {
         }
         break;
 
+    case HIR_EXPR_VLA_ALLOC:
+        indent(out, depth + 1);
+        fputs("runtime length\n", out);
+        print_expr(out, expr->vla_alloc.length, depth + 2);
+        break;
+
     case HIR_EXPR_LAMBDA:
+        break;
+
+    case HIR_EXPR_ANY_BOX:
+        indent(out, depth + 1);
+        fputs("witness ", out);
+        print_symbol(out, expr->any_box.vtable);
+        fputc('\n', out);
+        print_expr(out, expr->any_box.address, depth + 1);
+        break;
+
+    case HIR_EXPR_ANY_CALL:
+        indent(out, depth + 1);
+        fprintf(out, "method slot %zu%s\n", expr->any_call.method_index, expr->any_call.has_receiver ? " (instance)" : " (type)");
+        print_expr(out, expr->any_call.object, depth + 1);
+        for (size_t i = 0; i < expr->any_call.args.len; i++)
+            print_expr(out, ((HirExpr **)expr->any_call.args.data)[i], depth + 1);
+        break;
+
+    case HIR_EXPR_CODE:
+        indent(out, depth + 1);
+        if (expr->code.is_decl) {
+            fputs("declaration ", out);
+            if (expr->code.declaration != NULL)
+                fprintf(out, "[%zu:%zu+%zu]\n",
+                    source_line(expr->code.declaration->span.source, expr->code.declaration->span.offset),
+                    source_column(expr->code.declaration->span.source, expr->code.declaration->span.offset),
+                    expr->code.declaration->span.length);
+            else
+                fputs("<null>\n", out);
+            break;
+        }
+        if (expr->code.is_name) {
+            fputs("name ", out);
+            if (expr->code.name.kind == AST_NAME_IDENT)
+                fprintf(out, "%.*s\n", string_fmt(expr->code.name.ident));
+            else
+                fputs("<invalid>\n", out);
+            break;
+        }
+        fputs("syntax ", out);
+        if (expr->code.expression != NULL) {
+            fprintf(out, "[%zu:%zu+%zu] (%zu splices)\n",
+                source_line(expr->code.expression->span.source, expr->code.expression->span.offset),
+                source_column(expr->code.expression->span.source, expr->code.expression->span.offset),
+                expr->code.expression->span.length,
+                expr->code.splices.len);
+        } else {
+            fputs("<null>\n", out);
+        }
         break;
 
     case HIR_EXPR_ERROR:
@@ -352,6 +502,7 @@ static void print_stmt(FILE *out, const HirStmt *stmt, unsigned depth) {
     case HIR_STMT_WHILE:
         print_expr(out, stmt->_while.cond, depth + 1);
         print_stmt(out, stmt->_while.body, depth + 1);
+        print_stmt(out, stmt->_while.post, depth + 1);
         break;
 
     case HIR_STMT_BREAK:

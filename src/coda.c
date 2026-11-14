@@ -1,4 +1,5 @@
 #include <assert.h>
+#include "backends/orion/orion.h"
 #include "backends/x86_64/x86_64.h"
 #include "coda.h"
 
@@ -6,6 +7,9 @@ static const BackendApi *select_backend(const TargetInfo *target) {
     switch (target->arch) {
         case TARGET_ARCH_X86_64:
             return x86_64_backend();
+
+        case TARGET_ARCH_ORION:
+            return orion_backend();
 
         default:
             return NULL;
@@ -84,7 +88,7 @@ bool coda_compile(CodaCompiler *compiler, Source *source, CodaStage stage) {
 
     compiler->compilation.hir = hm;
 
-    LirModule *lir = lir_lower_module(compiler->arena, hm);
+    LirModule *lir = lir_lower_module(compiler->arena, hm, compiler->target);
     compiler->compilation.lir = lir;
     // lir_print(stderr, lir);
 

@@ -167,6 +167,9 @@ static bool abi_is_aggregate(HirType *type) {
     if (type == NULL)
         return false;
 
+    if (type->kind == HIR_TYPE_ANY || type->kind == HIR_TYPE_ANY_CONSTRAINT)
+        return true;
+
     return type->kind == HIR_TYPE_STRUCT || type->kind == HIR_TYPE_UNION ||
            type->kind == HIR_TYPE_ARRAY || type->kind == HIR_TYPE_SLICE ||
            type->kind == HIR_TYPE_SUM;
@@ -221,6 +224,12 @@ static void abi_classify_at(HirType *type, size_t offset, X86AbiClassification *
     }
 
     switch (type->kind) {
+        case HIR_TYPE_ANY:
+        case HIR_TYPE_ANY_CONSTRAINT:
+            abi_mark(classification, offset, sizeof(void *), X86_ABI_INTEGER);
+            abi_mark(classification, offset + sizeof(void *), sizeof(void *), X86_ABI_INTEGER);
+            return;
+
         case HIR_TYPE_BUILTIN:
         case HIR_TYPE_POINTER:
         case HIR_TYPE_ENUM:
@@ -707,6 +716,10 @@ static void load_operand(X86Function *function, const LirOperand *operand, X86Re
             break;
 
         case LIR_OPERAND_SYMBOL:
+            String name = symbol_link_name(operand->symbol);
+            fprintf(function->out, "    lea %s, %.*s[rip]\n", reg_name(reg, 8), (int)name.length, name.data);
+            break;
+
         case LIR_OPERAND_FLOAT:
         case LIR_OPERAND_INVALID:
             assert(!"unsupported operand");
@@ -980,7 +993,8 @@ static void emit_addr(X86Function *function, const LirInstruction *instruction) 
     const LirOperand *operand = &((LirOperand *)instruction->operands.data)[0];
 
     if (operand->kind == LIR_OPERAND_SYMBOL) {
-        fprintf(function->out, "    lea rax, %.*s[rip]\n", (int)operand->symbol->name.ident.length, operand->symbol->name.ident.data);
+        String name = symbol_link_name(operand->symbol);
+        fprintf(function->out, "    lea rax, %.*s[rip]\n", (int)name.length, name.data);
     } else if (operand->kind == LIR_OPERAND_VALUE) {
         X86Slot *source = slot(function, operand->value);
         fprintf(function->out, "    lea rax, [rbp%ld]\n", source->offset);
@@ -1187,7 +1201,10 @@ static void emit_operand_address(X86Function *function, const LirOperand *operan
         }
 
         case LIR_OPERAND_SYMBOL:
-            fprintf(function->out, "    lea %s, %.*s[rip]\n", reg_name(reg, 8), (int)operand->symbol->name.ident.length, operand->symbol->name.ident.data);
+            {
+                String name = symbol_link_name(operand->symbol);
+                fprintf(function->out, "    lea %s, %.*s[rip]\n", reg_name(reg, 8), (int)name.length, name.data);
+            }
             return;
 
         default:
@@ -1253,9 +1270,18 @@ static void emit_abi_stack_copy(X86Function *function, const LirOperand *operand
 
 static void emit_call(X86Function *function, const LirInstruction *instruction) {
     LirOperand *operands = instruction->operands.data;
-    Symbol *symbol = operands[0].symbol;
+    bool indirect_call = operands[0].kind != LIR_OPERAND_SYMBOL;
+    Symbol *symbol = indirect_call ? NULL : operands[0].symbol;
     size_t arg_count = instruction->operands.len - 1;
-    HirType *callee_type = base_type(symbol->type);
+    HirType *callee_type;
+    if (indirect_call) {
+        HirType *pointer_type = base_type(operands[0].type);
+        assert(pointer_type != NULL && pointer_type->kind == HIR_TYPE_POINTER);
+        callee_type = base_type(pointer_type->pointer.pointee);
+    } else {
+        assert(symbol != NULL);
+        callee_type = base_type(symbol->type);
+    }
     assert(callee_type != NULL && callee_type->kind == HIR_TYPE_FUNCTION);
 
     HirType *return_type = base_type(callee_type->function.ret);
@@ -1322,7 +1348,13 @@ static void emit_call(X86Function *function, const LirInstruction *instruction) 
         }
     }
 
-    fprintf(function->out, "    call %.*s\n", (int)symbol->name.ident.length, symbol->name.ident.data);
+    if (indirect_call) {
+        load_operand(function, &operands[0], X86_R10);
+        fprintf(function->out, "    call r10\n");
+    } else {
+        String name = symbol_link_name(symbol);
+        fprintf(function->out, "    call %.*s\n", (int)name.length, name.data);
+    }
     if (stack_size != 0)
         fprintf(function->out, "    add rsp, %zu\n", stack_size);
 
@@ -1420,6 +1452,33 @@ static void emit_instruction(X86Function *function, const LirInstruction *instru
         case LIR_OP_ZERO:
             emit_zero(function, instruction);
             break;
+
+        case LIR_OP_STACK_SAVE:
+            fprintf(function->out, "    mov rax, rsp\n");
+            store_register(function, X86_RAX, instruction->result, type_size(instruction->result_type));
+            break;
+
+        case LIR_OP_STACK_RESTORE: {
+            LirOperand *operands = instruction->operands.data;
+            load_operand(function, &operands[0], X86_RAX);
+            fprintf(function->out, "    mov rsp, rax\n");
+            break;
+        }
+
+        case LIR_OP_STACK_ALLOC: {
+            LirOperand *operands = instruction->operands.data;
+            size_t element_size = operands[1].offset;
+            size_t alignment = operands[2].offset;
+            load_operand(function, &operands[0], X86_RAX);
+            if (element_size == 0) fprintf(function->out, "    xor eax, eax\n");
+            else fprintf(function->out, "    imul rax, %zu\n", element_size);
+            if (alignment > 1) fprintf(function->out, "    add rax, %zu\n", alignment - 1);
+            fprintf(function->out, "    sub rsp, rax\n");
+            if (alignment > 1) fprintf(function->out, "    and rsp, -%zu\n", alignment);
+            fprintf(function->out, "    mov rax, rsp\n");
+            store_register(function, X86_RAX, instruction->result, type_size(instruction->result_type));
+            break;
+        }
 
         case LIR_OP_EXTRACT:
             emit_extract(function, instruction, false);
@@ -1596,14 +1655,19 @@ static void emit_terminator(X86Function *function, const LirTerminator *terminat
             emit_epilogue(function);
             break;
 
+        case LIR_TERM_UNREACHABLE:
+            fputs("    ud2\n", function->out);
+            break;
+
         default:
+            fprintf(stderr, "terminator %d not yet implemented\n", terminator->kind);
             assert(!"terminator not implemented yet");
     }
 }
 
 static void emit_function(X86Function *function) {
     const LirFunction *lir = function->function;
-    String name = lir->symbol->name.ident;
+    String name = symbol_link_name(lir->symbol);
 
     fprintf(function->out, "\n.section .text\n");
 
@@ -1642,7 +1706,7 @@ static bool global_is_zero(const LirGlobal *global) {
 }
 
 static void emit_global(FILE *out, const LirGlobal *global) {
-    String name = global->symbol->name.ident;
+    String name = symbol_link_name(global->symbol);
     const char *section = global->is_mutable ? ".data" : ".rodata";
 
     if (global_is_zero(global))
@@ -1710,7 +1774,10 @@ static void emit_global(FILE *out, const LirGlobal *global) {
                 break;
 
             case LIR_DATA_ADDRESS:
-                fprintf(out, "    .quad %.*s\n", (int)data->symbol->name.ident.length, data->symbol->name.ident.data);
+                {
+                    String name = symbol_link_name(data->symbol);
+                    fprintf(out, "    .quad %.*s\n", (int)name.length, name.data);
+                }
                 offset = data->offset + type_size(data->type);
                 break;
         }
@@ -1723,7 +1790,7 @@ static void emit_global(FILE *out, const LirGlobal *global) {
 }
 
 static void emit_string(FILE *out, const LirString *string) {
-    String name = string->symbol->name.ident;
+    String name = symbol_link_name(string->symbol);
 
     fprintf(out, "\n.section .rodata\n.balign 1\n%.*s:\n", (int)name.length, name.data);
 

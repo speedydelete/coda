@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -g -Werror -Wextra -Wall -Wno-unused -Wno-switch -MMD -std=gnu17 -O0 -fsanitize=undefined -fsanitize=address -fno-omit-frame-pointer
+CFLAGS = -g -Werror -Wextra -Wall -Wno-unused -Wno-switch -MMD -std=gnu17 -O2 -fsanitize=undefined -fsanitize=address -fno-omit-frame-pointer
 
 SRC := src
 
@@ -13,7 +13,7 @@ TARGET = codac
 
 BACKEND_DIRS = $(shell find $(SRC)/backends -mindepth 1 -maxdepth 1 -type d | sed 's|.*/||')
 BACKEND_SRCS = $(shell find $(SRC)/backends -type f -name "*.c" 2>/dev/null)
-BACKEND_OBJS = $(patsubst $(SRC)/%.c,build/backends/%.o,$(BACKEND_SRCS))
+BACKEND_OBJS = $(filter-out $(NATIVE_BACKEND_OBJS),$(patsubst $(SRC)/backends/%.c,build/backends/%.o,$(BACKEND_SRCS)))
 BACKEND_PIC_OBJS = $(patsubst $(SRC)/backends/%.c,build/backends-pic/%.o,$(BACKEND_SRCS))
 BACKENDS_SO = $(patsubst %,$(addprefix build/backends/,%.$(SOEXT)),$(BACKEND_DIRS))
 
@@ -86,8 +86,8 @@ $(LIB): $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	ar rcs $@ $^
 
-$(TARGET): $(CLI_OBJ) $(LIB) $(NATIVE_BACKEND_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(CLI_OBJ) $(LIB) $(NATIVE_BACKEND_OBJS) -rdynamic $(LDLIBS)
+$(TARGET): $(CLI_OBJ) $(LIB) $(NATIVE_BACKEND_OBJS) $(BACKEND_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(CLI_OBJ) $(LIB) $(NATIVE_BACKEND_OBJS) $(BACKEND_OBJS) -rdynamic $(LDLIBS)
 
 build/%.o: $(SRC)/%.c
 	@mkdir -p $(dir $@)
@@ -152,8 +152,8 @@ TEST_SRC = $(wildcard test/*.c)
 TEST_OBJS = $(patsubst test/%.c,build/test/%.o,$(TEST_SRC))
 TEST_TARGET = build/codac-test
 
-$(TEST_TARGET): $(TEST_OBJS) $(LIB)
-	$(CC) $(CFLAGS) -o $@ $(TEST_OBJS) $(NATIVE_BACKEND_OBJS) $(LIB)
+$(TEST_TARGET): $(TEST_OBJS) $(LIB) $(NATIVE_BACKEND_OBJS) $(BACKEND_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(TEST_OBJS) $(NATIVE_BACKEND_OBJS) $(BACKEND_OBJS) $(LIB)
 
 build/test/%.o: test/%.c
 	@mkdir -p $(dir $@)
@@ -162,4 +162,8 @@ build/test/%.o: test/%.c
 test: $(TARGET) $(TEST_TARGET)
 	$(TEST_TARGET) tests
 
--include $(patsubst %.o,%.d,$(LIB_OBJS) $(CLI_OBJ) $(BACKEND_OBJS) $(TEST_OBJS))
+.PHONY: install
+install: all
+	@sudo cp $(TARGET) /usr/bin
+
+-include $(patsubst %.o,%.d,$(LIB_OBJS) $(CLI_OBJ) $(NATIVE_BACKEND_OBJS) $(BACKEND_OBJS) $(TEST_OBJS))

@@ -2,12 +2,16 @@ module std::io;
 
 include std::system;
 
-type int = int32;
-type string = uint8[];
+include std::types : _;
 
 @export
 fn int print(string s) {
     return (int)std::system::syscall(std::system::SysNums::Write, 1, (uint64)s.ptr, (uint64)s.len);
+}
+
+@export
+fn int printc(char c) {
+    return (int)std::system::syscall(std::system::SysNums::Write, 1, (uint64)&c, 1);
 }
 
 @export

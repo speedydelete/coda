@@ -23,6 +23,7 @@ bool comp_expr_is_evaluable(HirExpr *expr);
 
 HirExpr *sema_coerce(Sema *sema, HirExpr *expr, HirType *type);
 HirExpr *sema_expr(Sema *sema, AstExpr *ast, HirType *expected);
+HirStmt *sema_assignment_stmt(Sema *sema, AstExpr *ast);
 bool sema_validate_param_defaults(Sema *sema, AstFnDecl *decl);
 bool sema_prepare_function_defaults(Sema *sema, Symbol *symbol, bool declaration_context);
 bool sema_map_call_arguments(Sema *sema, AstExpr *call, AstFnDecl *decl, size_t first_param, size_t *arg_params, bool *provided);
@@ -31,6 +32,7 @@ bool sema_complete_call_arguments(Sema *sema, Symbol *symbol, size_t first_param
 HirType *type_with_mutability(Sema *sema, HirType *type, bool mutable);
 HirType *builtin_type(Sema *sema, BuiltinType builtin);
 bool type_equal(HirType *a, HirType *b);
+bool sema_check_constraint_type(Sema *sema, Symbol *constraint, HirType *concrete, Span span);
 
 void sema_decl(Sema *sema, AstDecl *ast);
 void sema_constraint_decl(Sema *sema, AstConstraintDecl *ast);
@@ -97,6 +99,7 @@ static bool hir_stmt_terminates(HirStmt *stmt) {
         case HIR_STMT_RETURN:
         case HIR_STMT_BREAK:
         case HIR_STMT_CONTINUE:
+        case HIR_STMT_UNREACHABLE:
             return true;
 
         case HIR_STMT_BLOCK:
@@ -107,6 +110,9 @@ static bool hir_stmt_terminates(HirStmt *stmt) {
 
         case HIR_STMT_IF:
             return stmt->_if._else != NULL && hir_stmt_terminates(stmt->_if.then) && hir_stmt_terminates(stmt->_if._else);
+
+        case HIR_STMT_EXPR:
+            return hir_expr_is_noreturn_call(stmt->expr);
 
         default:
             return false;
@@ -131,8 +137,8 @@ static inline HirType *pointer_type(Sema *sema, HirType *pointee, bool optional)
     HirType *type = arena_calloc(sema->arena, sizeof(*type));
 
     type->kind = HIR_TYPE_POINTER;
-    type->size = sizeof(void *);
-    type->align = __alignof(void *);
+    type->size = sema->target->pointer.size;
+    type->align = sema->target->pointer.align;
     type->pointer.pointee = pointee;
     type->pointer.optional = optional;
 
@@ -143,6 +149,8 @@ void scope_insert(Scope *scope, Symbol *sym);
 Symbol *scope_lookup(Scope *scope, AstName name);
 Symbol *scope_lookup_fn_decl(Scope *scope, AstFnDecl *decl);
 Symbol *sema_lookup(Sema *sema, AstName name);
+Symbol *sema_lookup_fn_decl(Sema *sema, AstFnDecl *decl);
+Symbol *sema_lookup_non_method(Sema *sema, AstName name);
 Symbol *sema_lookup_path(Sema *sema, Path path);
 bool sema_is_place(HirExpr *expr);
 

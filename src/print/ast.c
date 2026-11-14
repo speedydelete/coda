@@ -48,6 +48,7 @@ static const char *type_kind_name(AstTypeKind kind) {
     case AST_TYPE_UNION:  return "union";
     case AST_TYPE_ENUM:   return "enum";
     case AST_TYPE_SPLICE: return "splice";
+    case AST_TYPE_CODE:   return "code";
     case AST_TYPE_ERROR:  return "error";
     }
 
@@ -73,6 +74,7 @@ static const char *expr_kind_name(AstExprKind kind) {
     case AST_EXPR_INIT:       return "init";
     case AST_EXPR_LAMBDA:     return "lambda";
     case AST_EXPR_SPLICE:     return "splice";
+    case AST_EXPR_QUOTE:      return "quote";
     }
 
     return "?";
@@ -194,6 +196,7 @@ static const char *binary_op_name(AstBinaryOp op) {
 static void print_type(FILE *out, const AstType *type, unsigned depth);
 
 static void print_stmt(FILE *out, const AstStmt *stmt, unsigned depth);
+static void print_decl(FILE *out, const AstDecl *decl, unsigned depth);
 
 static void print_expr(FILE *out, const AstExpr *expr, unsigned depth) {
     indent(out, depth);
@@ -385,6 +388,13 @@ static void print_expr(FILE *out, const AstExpr *expr, unsigned depth) {
 
     case AST_EXPR_SPLICE:
         print_expr(out, expr->splice.expression, depth + 1);
+        break;
+
+    case AST_EXPR_QUOTE:
+        if (expr->quote.is_declaration)
+            print_decl(out, expr->quote.declaration, depth + 1);
+        else
+            print_expr(out, expr->quote.expression, depth + 1);
         break;
 
     case AST_EXPR_ERROR:
@@ -620,6 +630,14 @@ static void print_type(FILE *out, const AstType *type, unsigned depth) {
 
     case AST_TYPE_SPLICE:
         print_expr(out, type->splice.expr, depth + 1);
+        break;
+
+    case AST_TYPE_CODE:
+        indent(out, depth + 1);
+        fprintf(out, "#code::%.*s", string_fmt(type->code.category));
+        if (type->code.has_selector)
+            fprintf(out, "<%.*s>", string_fmt(type->code.selector));
+        fputc('\n', out);
         break;
 
     case AST_TYPE_ERROR:

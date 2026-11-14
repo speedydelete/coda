@@ -36,6 +36,7 @@ typedef struct {
 
 typedef struct {
     AstModule *module;
+    AstModule *root_module;
 
     Array(Scope) scopes;
     Scope global_scope;
@@ -45,12 +46,14 @@ typedef struct {
 
     HirModule *hir_module;
     HirFunction *current_fn;
+    AstType *vla_type_allowed;
 
     ModuleIndex modules;
 
     Array(GenericInstance) generic_instances;
     Array(FunctionDefaults) function_defaults;
     size_t next_generic_instance;
+    size_t next_witness_table;
     Array(GenericTypeInstance) generic_type_instances;
     size_t type_indirection_depth;
 
@@ -65,11 +68,14 @@ typedef struct {
 static inline Sema sema_create(Arena *arena, Diags *diags) {
     return (Sema){
         .module = NULL,
+        .root_module = NULL,
         .scopes = array_create(arena, sizeof(Scope)),
         .current_fn = NULL,
+        .vla_type_allowed = NULL,
         .generic_instances = array_create(arena, sizeof(GenericInstance)),
         .function_defaults = array_create(arena, sizeof(FunctionDefaults)),
         .next_generic_instance = 0,
+        .next_witness_table = 0,
         .generic_type_instances = array_create(arena, sizeof(GenericTypeInstance)),
         .type_indirection_depth = 0,
         .global_scope = (Scope){
