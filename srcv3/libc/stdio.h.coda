@@ -1,0 +1,9 @@
+
+module codac::libc::stdio;
+
+@export
+type File = none;
+
+@export
+int32 EOF = -1;
+
