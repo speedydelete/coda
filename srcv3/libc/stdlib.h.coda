@@ -1,5 +1,0 @@
-
-module codac::libc::stdlib;
-
-@export
-

@@ -1,5 +1,0 @@
-
-module codac::libc;
-
-include codac::libc::stdlib;
-include codac::libc::stdio;
